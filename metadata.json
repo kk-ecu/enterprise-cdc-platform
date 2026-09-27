@@ -1,0 +1,6 @@
+{
+  "name": "Enterprise CDC Platform",
+  "description": "Enterprise-grade Change Data Capture (CDC) to Kafka Platform architecture, control plane console, and deployment framework.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,259 @@
+version: '3.8'
+
+networks:
+  cdc-net:
+    driver: bridge
+
+services:
+  # -------------------------------------------------------------
+  # 1. Apache Kafka in KRaft Mode (No ZooKeeper required!)
+  # -------------------------------------------------------------
+  kafka:
+    image: docker.io/apache/kafka:3.8.0
+    container_name: cdc-kafka
+    mem_limit: 1800m
+    networks:
+      - cdc-net
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_JVM_PERFORMANCE_OPTS: "-server -XX:+UseG1GC -XX:MaxGCPauseMillis=20"
+      KAFKA_HEAP_OPTS: "-Xms1024m -Xmx1280m"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # -------------------------------------------------------------
+  # 2. Confluent Schema Registry
+  # -------------------------------------------------------------
+  schema-registry:
+    image: docker.io/confluentinc/cp-schema-registry:7.7.0
+    container_name: cdc-schema-registry
+    mem_limit: 600m
+    networks:
+      - cdc-net
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:9092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_JVM_OPTS: "-Xms384m -Xmx512m"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8081/subjects || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # -------------------------------------------------------------
+  # 3. Debezium / Kafka Connect Distributed Cluster
+  # -------------------------------------------------------------
+  debezium-connect:
+    image: quay.io/debezium/connect:2.7
+    container_name: cdc-debezium-connect
+    mem_limit: 2400m
+    networks:
+      - cdc-net
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: 1
+      CONFIG_STORAGE_TOPIC: cdc_connect_configs
+      OFFSET_STORAGE_TOPIC: cdc_connect_offsets
+      STATUS_STORAGE_TOPIC: cdc_connect_statuses
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      KEY_CONVERTER_SCHEMAS_ENABLE: "true"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "true"
+      INTERNAL_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      INTERNAL_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      JAVA_OPTS: "-Xms1536m -Xmx2048m -XX:+UseG1GC -XX:MaxGCPauseMillis=20"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8083/connectors || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+
+  # -------------------------------------------------------------
+  # 4. Source Database 1: PostgreSQL 16 (Logical Replication Ready)
+  # -------------------------------------------------------------
+  postgres-source:
+    image: docker.io/postgres:16-alpine
+    container_name: cdc-postgres-source
+    mem_limit: 1400m
+    networks:
+      - cdc-net
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: orders_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespassword
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_replication_slots=5"
+      - "-c"
+      - "max_wal_senders=5"
+      - "-c"
+      - "shared_buffers=384MB"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d orders_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # -------------------------------------------------------------
+  # 5. Source Database 2: MySQL 8.4 (GTID & ROW Binlog Ready)
+  # -------------------------------------------------------------
+  mysql-source:
+    image: docker.io/mysql:8.4
+    container_name: cdc-mysql-source
+    mem_limit: 1400m
+    networks:
+      - cdc-net
+    ports:
+      - "3307:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: mysqlrootpassword
+      MYSQL_DATABASE: inventory
+      MYSQL_USER: mysqluser
+      MYSQL_PASSWORD: mysqlpassword
+    command:
+      - "--server-id=1001"
+      - "--log-bin=mysql-bin"
+      - "--binlog-format=ROW"
+      - "--binlog-row-image=FULL"
+      - "--gtid-mode=ON"
+      - "--enforce-gtid-consistency=ON"
+      - "--innodb_buffer_pool_size=512M"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -pmysqlrootpassword"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  # -------------------------------------------------------------
+  # 5b. Source Database: MariaDB 11.4 (GTID & ROW Binlog Ready)
+  # -------------------------------------------------------------
+  mariadb-source:
+    image: docker.io/mariadb:11.4
+    container_name: cdc-mariadb-source
+    mem_limit: 1200m
+    networks:
+      - cdc-net
+    ports:
+      - "3308:3306"
+    environment:
+      MARIADB_ROOT_PASSWORD: mariadbrootpassword
+      MARIADB_DATABASE: store_catalog
+      MARIADB_USER: mariadbuser
+      MARIADB_PASSWORD: mariadbpassword
+    command:
+      - "--server-id=1002"
+      - "--log-bin=mariadb-bin"
+      - "--binlog-format=ROW"
+      - "--binlog-row-image=FULL"
+      - "--gtid-strict-mode=ON"
+      - "--innodb-buffer-pool-size=384M"
+    healthcheck:
+      test: ["CMD-SHELL", "healthcheck.sh --connect --innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  # -------------------------------------------------------------
+  # 6. Source Database 3: MongoDB 7.0 (Replica Set Change Streams)
+  # -------------------------------------------------------------
+  mongo-source:
+    image: docker.io/mongo:7.0
+    container_name: cdc-mongo-source
+    mem_limit: 1000m
+    networks:
+      - cdc-net
+    ports:
+      - "27018:27017"
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.4"]
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --eval 'db.runCommand(\"ping\").ok' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # -------------------------------------------------------------
+  # 7. Control Plane Metadata Store (PostgreSQL)
+  # -------------------------------------------------------------
+  metadata-db:
+    image: docker.io/postgres:16-alpine
+    container_name: cdc-metadata-db
+    mem_limit: 700m
+    networks:
+      - cdc-net
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_DB: cdc_control_plane
+      POSTGRES_USER: cdc_admin
+      POSTGRES_PASSWORD: cdcadminpassword
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cdc_admin -d cdc_control_plane"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # -------------------------------------------------------------
+  # 8. Python 3.12 FastAPI Control Plane
+  # -------------------------------------------------------------
+  control-plane-api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: cdc-control-plane-api
+    mem_limit: 300m
+    networks:
+      - cdc-net
+    depends_on:
+      metadata-db:
+        condition: service_healthy
+      debezium-connect:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: "postgresql://cdc_admin:cdcadminpassword@metadata-db:5432/cdc_control_plane"
+      CONNECT_REST_URL: "http://debezium-connect:8083"
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
+      POSTGRES_SOURCE_URL: "postgresql://postgres:postgrespassword@postgres-source:5432/orders_db"
+      MYSQL_SOURCE_HOST: "mysql-source"
+      ENVIRONMENT: "local-m2"
